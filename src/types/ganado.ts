@@ -1,7 +1,4 @@
-// =====================================================
-// GanadoChain — Tipos del dominio
-// Plataforma descentralizada de subastas de ganado
-// =====================================================
+
 
 /** Grados de calidad veterinaria */
 export type QualityGrade = 'A' | 'B' | 'C' | 'D' | 'Rechazado';

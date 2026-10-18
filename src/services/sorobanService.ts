@@ -1,372 +1,480 @@
-// =====================================================
-// GanadoChain — Servicio de integración Soroban
-// Conecta Frontend ↔ Freighter ↔ Smart Contract
-// =====================================================
-//
-// Dependencias:
-//   npm install @stellar/stellar-sdk @stellar/freighter-api
-//
-// Uso:
-//   import { connectWallet, createLot, verifyLot, placeBid, settleAuction } from '@/services/sorobanService';
-
-import * as StellarSdk from '@stellar/stellar-sdk';
+import * as StellarSdk from "@stellar/stellar-sdk";
 import {
+  isConnected,
   requestAccess,
   signTransaction,
-  isConnected,
   getAddress,
   getNetworkDetails,
-} from '@stellar/freighter-api';
+} from "@stellar/freighter-api";
+import { STELLAR_CONFIG } from "@/config/stellar";
 
-import { STELLAR_CONFIG } from '@/config/stellar';
-import type {
-  CattleLot,
-  CreateLotParams,
-  VerifyLotParams,
-  PlaceBidParams,
-  AuctionSettlement,
-  ServiceResponse,
-  Bid,
-} from '@/types/ganado';
+// ============================================================================
+// CONFIGURACIÓN DE RED Y CONSTANTES
+// ============================================================================
 
-// ─── Soroban RPC client (SDK v17: rpc.Server) ───────
-const server = new StellarSdk.rpc.Server(
-  STELLAR_CONFIG.SOROBAN_RPC_URL,
-);
+export const SOROBAN_RPC_URL =
+  process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ||
+  STELLAR_CONFIG?.SOROBAN_RPC_URL ||
+  "https://soroban-testnet.stellar.org";
 
-// ─── Helpers internos ────────────────────────────────
+export const CONTRACT_ID =
+  process.env.NEXT_PUBLIC_CONTRACT_ID ||
+  STELLAR_CONFIG?.CONTRACT_ID ||
+  "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU45ZCBD3";
 
-/** Verifica que Freighter esté instalado y conectado */
-async function ensureFreighter(): Promise<string> {
-  const connected = await isConnected();
-  if (!connected) {
-    throw new Error(
-      'Freighter no está instalado o no está conectado. Instálalo desde freighter.app',
-    );
-  }
+export const NETWORK_PASSPHRASE =
+  STELLAR_CONFIG?.NETWORK_PASSPHRASE ||
+  "Test SDF Network ; September 2015";
 
-  const networkDetails = await getNetworkDetails();
-  if (networkDetails.networkPassphrase !== STELLAR_CONFIG.NETWORK_PASSPHRASE) {
-    throw new Error(
-      `Freighter está en otra red. Cámbialo a TESTNET en Settings → Network.`,
-    );
-  }
+// Servidor RPC de Soroban (Stellar SDK v17)
+const server = new StellarSdk.rpc.Server(SOROBAN_RPC_URL);
 
-  const { address, error } = await getAddress();
-  if (error) {
-    throw new Error(`Error obteniendo dirección de Freighter: ${error}`);
-  }
-  return address;
+// Escala de decimales: 1 USDC = 10,000,000 stroops (7 decimales)
+export const STROOP_FACTOR = 10_000_000n;
+
+// ============================================================================
+// TIPOS E INTERFACES
+// ============================================================================
+
+export interface TxResult {
+  txHash: string;
+  explorerUrl: string;
+  result?: unknown;
 }
 
-/** Carga la cuenta del usuario desde Soroban RPC */
-async function loadAccount(publicKey: string): Promise<StellarSdk.Account> {
-  const account = await server.getAccount(publicKey);
-  return account;
+export interface CattleLot {
+  id: number;
+  seller: string;
+  vet: string;
+  head_count: number;
+  base_price: number;       // En USDC normal (convertido de stroops)
+  highest_bid: number;      // En USDC normal
+  highest_bidder: string;
+  pest_free: boolean;
+  vet_score: number;
+  vet_notes: string;
+  is_verified: boolean;
+  is_settled: boolean;
 }
 
-/** Construye, simula, firma y envía una transacción Soroban */
-async function buildAndSubmitTx(
-  publicKey: string,
-  contractFn: string,
-  args: StellarSdk.xdr.ScVal[],
-): Promise<{ resultVal: StellarSdk.xdr.ScVal; txHash: string }> {
-  // 1. Cargar cuenta
-  const account = await loadAccount(publicKey);
+// ============================================================================
+// CONVERSORES DE DECIMALES (STROOPS)
+// ============================================================================
 
-  // 2. Crear la operación invokeContract
-  const contract = new StellarSdk.Contract(STELLAR_CONFIG.CONTRACT_ID);
-  const operation = contract.call(contractFn, ...args);
+/**
+ * Convierte un monto numérico a 7 decimales (stroops de Stellar) en formato BigInt
+ */
+export function toStroops(amount: number): bigint {
+  if (isNaN(amount) || amount < 0) {
+    throw new Error(`Monto inválido para conversión a stroops: ${amount}`);
+  }
+  return BigInt(Math.round(amount * 10_000_000));
+}
 
-  // 3. Construir la transacción
+/**
+ * Convierte un valor en stroops (BigInt o number) a su valor real en USDC
+ */
+export function fromStroops(stroops: bigint | number | string): number {
+  return Number(stroops) / 10_000_000;
+}
+
+/**
+ * Enlace directo al explorador de transacciones de Stellar Testnet
+ */
+export function getExplorerUrl(txHash: string): string {
+  return `https://stellar.expert/explorer/testnet/tx/${txHash}`;
+}
+
+// ============================================================================
+// HELPER PARA CONSTRUIR, SIMULAR, FIRMAR Y ENVIAR TRANSACCIONES
+// ============================================================================
+
+async function invokeContractTx(
+  callerPublicKey: string,
+  functionName: string,
+  args: StellarSdk.xdr.ScVal[]
+): Promise<TxResult> {
+  // 1. Cargar cuenta del firmante
+  const account = await server.getAccount(callerPublicKey);
+
+  // 2. Preparar la llamada al contrato
+  const contract = new StellarSdk.Contract(CONTRACT_ID);
+  const operation = contract.call(functionName, ...args);
+
+  // 3. Construir transacción base
   const tx = new StellarSdk.TransactionBuilder(account, {
     fee: StellarSdk.BASE_FEE,
-    networkPassphrase: STELLAR_CONFIG.NETWORK_PASSPHRASE,
+    networkPassphrase: NETWORK_PASSPHRASE,
   })
     .addOperation(operation)
-    .setTimeout(STELLAR_CONFIG.TX_TIMEOUT_SEC)
+    .setTimeout(30)
     .build();
 
-  // 4. Simular para obtener footprint y costos
-  const simulated = await server.simulateTransaction(tx);
-
-  if (StellarSdk.rpc.Api.isSimulationError(simulated)) {
-    throw new Error(`Simulación falló: ${simulated.error}`);
+  // 4. Simular la transacción para calcular recursos y footprint
+  const simulation = await server.simulateTransaction(tx);
+  if (StellarSdk.rpc.Api.isSimulationError(simulation)) {
+    throw new Error(`Fallo en la simulación de Soroban: ${simulation.error}`);
   }
 
-  // 5. Preparar la transacción con el resultado de la simulación
-  const preparedTx = StellarSdk.rpc.assembleTransaction(
-    tx,
-    simulated,
-  ).build();
+  // 5. Ensamblar la transacción con los datos de simulación
+  const preparedTx = StellarSdk.rpc.assembleTransaction(tx, simulation).build();
 
-  // 6. Firmar con Freighter (v6 API: devuelve { signedTxXdr, signerAddress, error? })
-  const signResult = await signTransaction(preparedTx.toXDR(), {
-    networkPassphrase: STELLAR_CONFIG.NETWORK_PASSPHRASE,
+  // 6. Solicitar firma a Freighter
+  const signResponse = await signTransaction(preparedTx.toXDR(), {
+    networkPassphrase: NETWORK_PASSPHRASE,
+    address: callerPublicKey,
   });
 
-  if (signResult.error) {
-    throw new Error(`Error al firmar con Freighter: ${signResult.error}`);
+  let signedXdr: string;
+  if (typeof signResponse === "object" && signResponse !== null) {
+    if ("error" in signResponse && signResponse.error) {
+      throw new Error(`Firma rechazada por el usuario en Freighter: ${signResponse.error}`);
+    }
+    signedXdr = (signResponse as { signedTxXdr: string }).signedTxXdr;
+  } else {
+    signedXdr = signResponse as string;
   }
 
-  // 7. Enviar la transacción firmada
+  if (!signedXdr) {
+    throw new Error("No se recibió la transacción firmada desde Freighter.");
+  }
+
+  // 7. Enviar la transacción firmada a la red
   const signedTx = StellarSdk.TransactionBuilder.fromXDR(
-    signResult.signedTxXdr,
-    STELLAR_CONFIG.NETWORK_PASSPHRASE,
+    signedXdr,
+    NETWORK_PASSPHRASE
   ) as StellarSdk.Transaction;
 
   const sendResponse = await server.sendTransaction(signedTx);
-
-  if (sendResponse.status === 'ERROR') {
-    throw new Error(`Error al enviar tx: ${JSON.stringify(sendResponse.errorResult)}`);
+  if (sendResponse.status === "ERROR") {
+    throw new Error(`Error al enviar la transacción: ${JSON.stringify(sendResponse.errorResult)}`);
   }
 
-  // 8. Polling hasta confirmación
+  // 8. Esperar la confirmación en el ledger (polling)
   const txHash = sendResponse.hash;
-  let getResponse = await server.getTransaction(txHash);
-  
-  while (getResponse.status === StellarSdk.rpc.Api.GetTransactionStatus.NOT_FOUND) {
-    await new Promise((r) => setTimeout(r, 1000));
-    getResponse = await server.getTransaction(txHash);
+  let txResult = await server.getTransaction(txHash);
+
+  while (txResult.status === StellarSdk.rpc.Api.GetTransactionStatus.NOT_FOUND) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    txResult = await server.getTransaction(txHash);
   }
 
-  if (getResponse.status === StellarSdk.rpc.Api.GetTransactionStatus.FAILED) {
-    throw new Error(`Transacción falló: ${txHash}`);
+  if (txResult.status === StellarSdk.rpc.Api.GetTransactionStatus.FAILED) {
+    throw new Error(`La transacción falló en el contrato. Hash: ${txHash}`);
   }
 
-  // 9. Extraer el valor de retorno
-  const resultVal = getResponse.returnValue!;
-  return { resultVal, txHash };
+  let parsedReturnValue: unknown = null;
+  if (txResult.returnValue) {
+    try {
+      parsedReturnValue = StellarSdk.scValToNative(txResult.returnValue);
+    } catch {
+      parsedReturnValue = txResult.returnValue;
+    }
+  }
+
+  return {
+    txHash,
+    explorerUrl: getExplorerUrl(txHash),
+    result: parsedReturnValue,
+  };
 }
 
-// ─── FUNCIONES PÚBLICAS ──────────────────────────────
+// ============================================================================
+// 1. CONECTAR WALLET
+// ============================================================================
 
 /**
- * 1️⃣ CONECTAR WALLET
- * Solicita acceso a Freighter y retorna la dirección pública.
+ * Solicita acceso a la extensión Freighter y devuelve la clave pública (G...) activa.
  */
-export async function connectWallet(): Promise<ServiceResponse<{ publicKey: string }>> {
+export async function conectarWallet(): Promise<string> {
   try {
-    const publicKey = await ensureFreighter();
-    await requestAccess();
-    return {
-      success: true,
-      data: { publicKey },
-    };
+    const connectedResult = await isConnected();
+    const isInstalled =
+      typeof connectedResult === "boolean"
+        ? connectedResult
+        : (connectedResult as { isConnected: boolean })?.isConnected;
+
+    if (!isInstalled) {
+      throw new Error(
+        "Freighter no está instalado o está deshabilitado. Instálalo desde https://freighter.app"
+      );
+    }
+
+    const access = await requestAccess();
+    if (typeof access === "object" && access !== null && "error" in access && access.error) {
+      throw new Error(`Acceso denegado: ${access.error}`);
+    }
+
+    const addrResult = await getAddress();
+    if (addrResult.error) {
+      throw new Error(`Error obteniendo dirección: ${addrResult.error}`);
+    }
+
+    try {
+      const net = await getNetworkDetails();
+      if (net.networkPassphrase && net.networkPassphrase !== NETWORK_PASSPHRASE) {
+        console.warn("⚠️ Asegúrate de cambiar la red de Freighter a Testnet.");
+      }
+    } catch {
+      // Ignorar si getNetworkDetails no está disponible
+    }
+
+    return addrResult.address;
   } catch (error: unknown) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Error desconocido conectando wallet',
-    };
+    const msg = error instanceof Error ? error.message : "Error al conectar con Freighter";
+    console.error("[conectarWallet]", msg);
+    throw new Error(msg);
   }
 }
 
-/**
- * 2️⃣ CREAR LOTE DE GANADO
- * Registra un nuevo lote en el smart contract.
- *
- * Ejemplo:
- *   await createLot({
- *     breed: 'Angus',
- *     head_count: 50,
- *     weight_kg: 25000,
- *     location: 'Córdoba, Argentina',
- *     base_price_usdc: 150000,  // 150,000 USDC
- *   });
- */
-export async function createLot(
-  params: CreateLotParams,
-): Promise<ServiceResponse<CattleLot>> {
-  try {
-    const publicKey = await ensureFreighter();
+// ============================================================================
+// 2. CREAR LOTE DE GANADO
+// ============================================================================
 
-    // Convertir parámetros a ScVal para Soroban
+/**
+ * Llama a 'create_lot' en el Smart Contract.
+ * Escala precioBaseUsdc a 7 decimales (stroops).
+ *
+ * @param sellerAddr Dirección pública del vendedor/ganadero
+ * @param vetAddr Dirección pública del veterinario asignado
+ * @param cabezas Número de cabezas de ganado
+ * @param precioBaseUsdc Precio base en USDC (ej: 100 -> 1,000,000,000 stroops)
+ */
+export async function crearLoteGanado(
+  sellerAddr: string,
+  vetAddr: string,
+  cabezas: number,
+  precioBaseUsdc: number
+): Promise<TxResult> {
+  try {
+    if (!sellerAddr || !vetAddr) {
+      throw new Error("Se requiere la dirección del vendedor y del veterinario.");
+    }
+    if (cabezas <= 0) {
+      throw new Error("El número de cabezas debe ser mayor a 0.");
+    }
+
+    const basePriceStroops = toStroops(precioBaseUsdc);
+
+    // Parámetros tipados como ScVal para Soroban:
+    // create_lot(seller: Address, vet: Address, head_count: u32, base_price: i128)
     const args: StellarSdk.xdr.ScVal[] = [
-      StellarSdk.nativeToScVal(publicKey, { type: 'address' }),            // owner
-      StellarSdk.nativeToScVal(params.breed, { type: 'string' }),          // breed
-      StellarSdk.nativeToScVal(params.head_count, { type: 'u32' }),        // head_count
-      StellarSdk.nativeToScVal(params.weight_kg, { type: 'u32' }),         // weight_kg
-      StellarSdk.nativeToScVal(params.location, { type: 'string' }),       // location
-      StellarSdk.nativeToScVal(BigInt(params.base_price_usdc * 1e7), { type: 'i128' }), // base_price (7 decimals USDC)
+      StellarSdk.nativeToScVal(sellerAddr, { type: "address" }),
+      StellarSdk.nativeToScVal(vetAddr, { type: "address" }),
+      StellarSdk.nativeToScVal(cabezas, { type: "u32" }),
+      StellarSdk.nativeToScVal(basePriceStroops, { type: "i128" }),
     ];
 
-    const { resultVal, txHash } = await buildAndSubmitTx(publicKey, 'create_lot', args);
-
-    // Parsear resultado — el contrato retorna el struct del lote
-    const lotData = StellarSdk.scValToNative(resultVal) as CattleLot;
-
-    return {
-      success: true,
-      data: lotData,
-      tx_hash: txHash,
-    };
+    return await invokeContractTx(sellerAddr, "create_lot", args);
   } catch (error: unknown) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Error creando lote',
-    };
+    const msg = error instanceof Error ? error.message : "Error al crear lote de ganado";
+    console.error("[crearLoteGanado]", msg);
+    throw new Error(msg);
   }
 }
+
+// ============================================================================
+// 3. VERIFICAR VETERINARIO
+// ============================================================================
 
 /**
- * 3️⃣ VERIFICACIÓN VETERINARIA
- * Un veterinario autorizado verifica el control de plagas y califica el lote.
+ * Llama a 'verify_lot' en el Smart Contract firmada por el veterinario.
  *
- * Ejemplo:
- *   await verifyLot({
- *     lot_id: 'LOT-001',
- *     pest_control_passed: true,
- *     quality_grade: 'A',
- *     notes: 'Lote en excelentes condiciones',
- *   });
+ * @param vetAddr Dirección pública del veterinario
+ * @param lotId ID numérico del lote
+ * @param pestFree Booleano: certificado libre de plagas/garrapatas
+ * @param score Calificación veterinaria (ej: 1 a 5)
+ * @param notas Notas o referencia del certificado SENASAG
  */
-export async function verifyLot(
-  params: VerifyLotParams,
-): Promise<ServiceResponse<{ verified: boolean }>> {
+export async function verificarVeterinario(
+  vetAddr: string,
+  lotId: number | bigint,
+  pestFree: boolean,
+  score: number,
+  notas: string
+): Promise<TxResult> {
   try {
-    const publicKey = await ensureFreighter();
+    if (!vetAddr) {
+      throw new Error("Se requiere la dirección del veterinario.");
+    }
 
-    const gradeMap: Record<string, number> = {
-      'A': 0, 'B': 1, 'C': 2, 'D': 3, 'Rechazado': 4,
-    };
-
+    // verify_lot(lot_id: u64, pest_free: bool, vet_score: u32, vet_notes: String)
     const args: StellarSdk.xdr.ScVal[] = [
-      StellarSdk.nativeToScVal(params.lot_id, { type: 'string' }),                 // lot_id
-      StellarSdk.nativeToScVal(publicKey, { type: 'address' }),                     // veterinarian
-      StellarSdk.nativeToScVal(params.pest_control_passed, { type: 'bool' }),       // pest_control_passed
-      StellarSdk.nativeToScVal(gradeMap[params.quality_grade], { type: 'u32' }),    // quality_grade (enum index)
+      StellarSdk.nativeToScVal(BigInt(lotId), { type: "u64" }),
+      StellarSdk.nativeToScVal(pestFree, { type: "bool" }),
+      StellarSdk.nativeToScVal(score, { type: "u32" }),
+      StellarSdk.nativeToScVal(notas || "SENASAG_OK", { type: "string" }),
     ];
 
-    const { resultVal, txHash } = await buildAndSubmitTx(publicKey, 'verify_lot', args);
-    const verified = StellarSdk.scValToNative(resultVal) as boolean;
-
-    return {
-      success: true,
-      data: { verified },
-      tx_hash: txHash,
-    };
+    return await invokeContractTx(vetAddr, "verify_lot", args);
   } catch (error: unknown) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Error verificando lote',
-    };
+    const msg = error instanceof Error ? error.message : "Error al certificar lote";
+    console.error("[verificarVeterinario]", msg);
+    throw new Error(msg);
   }
 }
+
+// ============================================================================
+// 4. REALIZAR PUJA
+// ============================================================================
 
 /**
- * 4️⃣ REALIZAR PUJA
- * Coloca una puja en una subasta activa.
+ * Llama a 'place_bid' en el Smart Contract.
+ * Escala montoUsdc a 7 decimales (stroops).
  *
- * Ejemplo:
- *   await placeBid({
- *     lot_id: 'LOT-001',
- *     amount_usdc: 160000,  // 160,000 USDC
- *   });
+ * @param compradorAddr Dirección pública del pujador
+ * @param lotId ID numérico del lote
+ * @param montoUsdc Monto de la puja en USDC
  */
-export async function placeBid(
-  params: PlaceBidParams,
-): Promise<ServiceResponse<Bid>> {
+export async function realizarPuja(
+  compradorAddr: string,
+  lotId: number | bigint,
+  montoUsdc: number
+): Promise<TxResult> {
   try {
-    const publicKey = await ensureFreighter();
+    if (!compradorAddr) {
+      throw new Error("Se requiere la dirección del comprador.");
+    }
 
+    const bidAmountStroops = toStroops(montoUsdc);
+
+    // place_bid(lot_id: u64, bidder: Address, bid_amount: i128)
     const args: StellarSdk.xdr.ScVal[] = [
-      StellarSdk.nativeToScVal(params.lot_id, { type: 'string' }),                       // lot_id
-      StellarSdk.nativeToScVal(publicKey, { type: 'address' }),                           // bidder
-      StellarSdk.nativeToScVal(BigInt(params.amount_usdc * 1e7), { type: 'i128' }),      // amount (7 decimals)
+      StellarSdk.nativeToScVal(BigInt(lotId), { type: "u64" }),
+      StellarSdk.nativeToScVal(compradorAddr, { type: "address" }),
+      StellarSdk.nativeToScVal(bidAmountStroops, { type: "i128" }),
     ];
 
-    const { resultVal, txHash } = await buildAndSubmitTx(publicKey, 'place_bid', args);
-    const bidData = StellarSdk.scValToNative(resultVal) as Bid;
-
-    return {
-      success: true,
-      data: bidData,
-      tx_hash: txHash,
-    };
+    return await invokeContractTx(compradorAddr, "place_bid", args);
   } catch (error: unknown) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Error al pujar',
-    };
+    const msg = error instanceof Error ? error.message : "Error al realizar puja";
+    console.error("[realizarPuja]", msg);
+    throw new Error(msg);
   }
 }
+
+// ============================================================================
+// 5. LIQUIDAR SUBASTA
+// ============================================================================
 
 /**
- * 5️⃣ LIQUIDAR SUBASTA
- * Cierra la subasta, transfiere USDC al vendedor, cobra 0.25% de comisión.
+ * Llama a 'settle_auction' en el Smart Contract.
+ * Transfiere el pago en USDC al vendedor y descuenta la comisión del protocolo.
  *
- * Ejemplo:
- *   await settleAuction('LOT-001');
+ * @param compradorAddr Dirección pública del comprador ganador
+ * @param lotId ID numérico del lote a liquidar
  */
-export async function settleAuction(
-  lotId: string,
-): Promise<ServiceResponse<AuctionSettlement>> {
+export async function liquidarSubasta(
+  compradorAddr: string,
+  lotId: number | bigint
+): Promise<TxResult> {
   try {
-    const publicKey = await ensureFreighter();
+    if (!compradorAddr) {
+      throw new Error("Se requiere la dirección de quien ejecuta la liquidación.");
+    }
 
+    // settle_auction(lot_id: u64)
     const args: StellarSdk.xdr.ScVal[] = [
-      StellarSdk.nativeToScVal(lotId, { type: 'string' }), // lot_id
+      StellarSdk.nativeToScVal(BigInt(lotId), { type: "u64" }),
     ];
 
-    const { resultVal, txHash } = await buildAndSubmitTx(publicKey, 'settle_auction', args);
-    const settlement = StellarSdk.scValToNative(resultVal) as AuctionSettlement;
-
-    // Agregar el hash de la tx al resultado
-    settlement.tx_hash = txHash;
-
-    return {
-      success: true,
-      data: settlement,
-      tx_hash: txHash,
-    };
+    return await invokeContractTx(compradorAddr, "settle_auction", args);
   } catch (error: unknown) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Error liquidando subasta',
-    };
+    const msg = error instanceof Error ? error.message : "Error al liquidar subasta";
+    console.error("[liquidarSubasta]", msg);
+    throw new Error(msg);
   }
 }
 
-// ─── UTILIDADES EXTRAS ──────────────────────────────
+// ============================================================================
+// 6. LECTURA: OBTENER LOTE (READ-ONLY)
+// ============================================================================
 
-/** Obtener fondos de prueba de Friendbot (solo Testnet) */
+/**
+ * Consulta el estado de un lote mediante simulación (sin requerir firma ni gas).
+ */
+export async function obtenerLote(lotId: number | bigint): Promise<CattleLot> {
+  try {
+    const contract = new StellarSdk.Contract(CONTRACT_ID);
+    const operation = contract.call(
+      "get_lot",
+      StellarSdk.nativeToScVal(BigInt(lotId), { type: "u64" })
+    );
+
+    // Simulación anónima usando la dirección del propio contrato como fuente temporal
+    const fakeAccount = new StellarSdk.Account(CONTRACT_ID, "0");
+    const tx = new StellarSdk.TransactionBuilder(fakeAccount, {
+      fee: StellarSdk.BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+    if (StellarSdk.rpc.Api.isSimulationError(sim) || !sim.result?.retval) {
+      throw new Error(`Lote #${lotId} no encontrado en el contrato`);
+    }
+
+    const raw: any = StellarSdk.scValToNative(sim.result.retval);
+
+    return {
+      id: Number(raw.id ?? lotId),
+      seller: String(raw.seller ?? ""),
+      vet: String(raw.vet ?? ""),
+      head_count: Number(raw.head_count ?? 0),
+      base_price: fromStroops(raw.base_price ?? 0),
+      highest_bid: fromStroops(raw.highest_bid ?? 0),
+      highest_bidder: String(raw.highest_bidder ?? ""),
+      pest_free: Boolean(raw.pest_free),
+      vet_score: Number(raw.vet_score ?? 0),
+      vet_notes: String(raw.vet_notes ?? ""),
+      is_verified: Boolean(raw.is_verified),
+      is_settled: Boolean(raw.is_settled),
+    };
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : `Error obteniendo lote #${lotId}`;
+    console.error("[obtenerLote]", msg);
+    throw new Error(msg);
+  }
+}
+
+// ============================================================================
+// UTILIDADES ADICIONALES Y ALIAS DE COMPATIBILIDAD
+// ============================================================================
+
 export async function fundWithFriendbot(address: string): Promise<boolean> {
   try {
-    const response = await fetch(
-      `${STELLAR_CONFIG.FRIENDBOT_URL}?addr=${encodeURIComponent(address)}`,
-    );
-    return response.ok;
+    const res = await fetch(`https://friendbot.stellar.org?addr=${encodeURIComponent(address)}`);
+    return res.ok;
   } catch {
     return false;
   }
 }
 
-/** Consultar el balance de la cuenta */
-export async function getAccountBalance(
-  publicKey: string,
-): Promise<{ xlm: string; usdc: string }> {
-  try {
-    const horizonServer = new StellarSdk.Horizon.Server(STELLAR_CONFIG.HORIZON_URL);
-    const account = await horizonServer.loadAccount(publicKey);
-
-    let xlm = '0';
-    let usdc = '0';
-
-    for (const balance of account.balances) {
-      if (balance.asset_type === 'native') {
-        xlm = balance.balance;
-      }
-      // Ajustar el issuer según el USDC que usen en Testnet
-      if (
-        'asset_code' in balance &&
-        balance.asset_code === 'USDC'
-      ) {
-        usdc = balance.balance;
-      }
-    }
-
-    return { xlm, usdc };
-  } catch {
-    return { xlm: '0', usdc: '0' };
-  }
-}
+// Alias para compatibilidad con código existente
+export const connectWallet = async () => ({
+  success: true,
+  data: { publicKey: await conectarWallet() },
+  error: undefined as string | undefined,
+});
+export const createLot = async (params: { breed?: string; head_count: number; weight_kg?: number; location?: string; base_price_usdc: number }) => {
+  const pubKey = await conectarWallet();
+  const res = await crearLoteGanado(pubKey, pubKey, params.head_count, params.base_price_usdc);
+  return { success: true, tx_hash: res.txHash, data: null, error: undefined as string | undefined };
+};
+export const verifyLot = async (params: { lot_id: string | number; pest_control_passed: boolean; quality_grade?: string; notes?: string }) => {
+  const pubKey = await conectarWallet();
+  const res = await verificarVeterinario(pubKey, typeof params.lot_id === "string" ? parseInt(params.lot_id.replace(/\D/g, "") || "1", 10) : params.lot_id, params.pest_control_passed, 5, params.notes ?? "");
+  return { success: true, tx_hash: res.txHash, error: undefined as string | undefined };
+};
+export const placeBid = async (params: { lot_id: string | number; amount_usdc: number }) => {
+  const pubKey = await conectarWallet();
+  const res = await realizarPuja(pubKey, typeof params.lot_id === "string" ? parseInt(params.lot_id.replace(/\D/g, "") || "1", 10) : params.lot_id, params.amount_usdc);
+  return { success: true, tx_hash: res.txHash, error: undefined as string | undefined };
+};
+export const settleAuction = async (lotId: string | number) => {
+  const pubKey = await conectarWallet();
+  const res = await liquidarSubasta(pubKey, typeof lotId === "string" ? parseInt(lotId.replace(/\D/g, "") || "1", 10) : lotId);
+  return { success: true, tx_hash: res.txHash, data: null, error: undefined as string | undefined };
+};

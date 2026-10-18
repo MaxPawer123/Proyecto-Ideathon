@@ -11,6 +11,7 @@ import {
 import { Lote, TxResult, corto } from "@/lib/types";
 import { CONFIG, Rol } from "@/lib/config";
 import LoteCard from "@/components/LoteCard";
+import AlbedoConnect from "@/components/AlbedoConnect";
 
 const ROLES: { id: Rol; label: string; icon: string; desc: string }[] = [
   { id: "ganadero", label: "Empresa Agropecuaria", icon: "🐄", desc: "Publica lotes de ganado para subasta" },
@@ -114,29 +115,42 @@ export default function Home() {
             Testnet
           </div>
         </div>
-        <button
-          id="connect-wallet-btn"
-          className={`btn-connect ${addr ? "connected" : ""} ${connecting ? "connecting" : ""}`}
-          onClick={handleConnect}
-          disabled={connecting}
-        >
-          {connecting ? (
-            <>
-              <span className="spinner" />
-              Conectando…
-            </>
-          ) : addr ? (
-            <>
-              <span className="wallet-icon">🟢</span>
-              {corto(addr)}
-            </>
-          ) : (
-            <>
-              <span className="wallet-icon">🔗</span>
-              Conectar Freighter
-            </>
-          )}
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+          <AlbedoConnect
+            currentAddress={addr}
+            onAddressChange={(newAddr) => {
+              setAddr(newAddr);
+              if (newAddr) {
+                setMsg({ ok: true, text: "Billetera conectada con éxito mediante Albedo (Web/Móvil)" });
+              }
+            }}
+          />
+          <button
+            id="connect-wallet-btn"
+            className={`btn-connect ${addr ? "connected" : ""} ${connecting ? "connecting" : ""}`}
+            onClick={handleConnect}
+            disabled={connecting}
+            style={{ fontSize: "0.85rem", opacity: 0.85 }}
+            title="Opción alternativa con extensión"
+          >
+            {connecting ? (
+              <>
+                <span className="spinner" />
+                Conectando…
+              </>
+            ) : addr ? (
+              <>
+                <span className="wallet-icon">🟢</span>
+                {corto(addr)}
+              </>
+            ) : (
+              <>
+                <span className="wallet-icon">🔗</span>
+                Freighter
+              </>
+            )}
+          </button>
+        </div>
       </header>
 
       {/* ── Role Selector ── */}
