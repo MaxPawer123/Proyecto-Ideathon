@@ -28,8 +28,23 @@ export type Lote = {
 
 export type TxResult = { hash: string; explorerUrl: string };
 
-export const explorerTx = (hash: string) =>
-  `https://stellar.expert/explorer/testnet/tx/${hash}`;
+export const CONTRACT_ID =
+  process.env.NEXT_PUBLIC_CONTRACT_ID || "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
+
+export const FALLBACK_CONTRACT_URL =
+  `https://stellar.expert/explorer/testnet/contract/${CONTRACT_ID}`;
+
+/**
+ * Genera la URL del explorador de Stellar Expert.
+ * Si el hash es real y válido, enlaza directamente a la transacción en Testnet.
+ * Si la red falló o es una simulación/mock, enlaza al contrato inteligente en Testnet.
+ */
+export const explorerTx = (hash?: string): string => {
+  if (!hash || hash.length !== 64 || hash.startsWith("mock") || hash.startsWith("simulated")) {
+    return FALLBACK_CONTRACT_URL;
+  }
+  return `https://stellar.expert/explorer/testnet/tx/${hash}`;
+};
 
 // Comisión 0.25% = 25 / 10000 (misma fórmula que el contrato)
 export const calcularComision = (total: number) => {

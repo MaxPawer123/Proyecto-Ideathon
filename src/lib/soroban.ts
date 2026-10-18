@@ -1,8 +1,6 @@
 // =====================================================
 // Punto de entrada ÚNICO para el servicio Soroban.
-// Las pantallas importan solo de "@/lib/soroban".
-//
-// Mientras no hay contrato desplegado: "./soroban.mock"
-// Cuando el contrato esté listo:      "./soroban.real"
+// Las pantallas importan de "@/lib/soroban".
+// Conecta en modo real a Testnet con fallback de contrato seguro.
 // =====================================================
-export * from "./soroban.mock";
+export * from "./soroban.real";

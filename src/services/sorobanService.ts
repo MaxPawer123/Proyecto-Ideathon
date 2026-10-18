@@ -7,6 +7,7 @@ import {
   getNetworkDetails,
 } from "@stellar/freighter-api";
 import { STELLAR_CONFIG } from "@/config/stellar";
+import { firmarTransaccionAlbedo } from "@/services/albedoService";
 
 // ============================================================================
 // CONFIGURACIÓN DE RED Y CONSTANTES
@@ -20,7 +21,7 @@ export const SOROBAN_RPC_URL =
 export const CONTRACT_ID =
   process.env.NEXT_PUBLIC_CONTRACT_ID ||
   STELLAR_CONFIG?.CONTRACT_ID ||
-  "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU45ZCBD3";
+  "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
 
 export const NETWORK_PASSPHRASE =
   STELLAR_CONFIG?.NETWORK_PASSPHRASE ||
@@ -86,6 +87,25 @@ export function getExplorerUrl(txHash: string): string {
 }
 
 // ============================================================================
+// CARGA Y FONDEO AUTOMÁTICO DE CUENTAS TESTNET
+// ============================================================================
+
+async function loadAccountSafe(publicKey: string): Promise<StellarSdk.Account> {
+  try {
+    return await server.getAccount(publicKey);
+  } catch (err: unknown) {
+    const errorStr = String(err);
+    if (errorStr.includes("not found") || errorStr.includes("Account not found")) {
+      console.warn(`[GanadoChain] Cuenta ${publicKey} nueva en Testnet. Fondeando automáticamente con Friendbot...`);
+      await fundWithFriendbot(publicKey);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return await server.getAccount(publicKey);
+    }
+    throw err;
+  }
+}
+
+// ============================================================================
 // HELPER PARA CONSTRUIR, SIMULAR, FIRMAR Y ENVIAR TRANSACCIONES
 // ============================================================================
 
@@ -94,8 +114,8 @@ async function invokeContractTx(
   functionName: string,
   args: StellarSdk.xdr.ScVal[]
 ): Promise<TxResult> {
-  // 1. Cargar cuenta del firmante
-  const account = await server.getAccount(callerPublicKey);
+  // 1. Cargar cuenta del firmante (con auto-fondeo en Testnet si es nueva)
+  const account = await loadAccountSafe(callerPublicKey);
 
   // 2. Preparar la llamada al contrato
   const contract = new StellarSdk.Contract(CONTRACT_ID);
@@ -119,27 +139,57 @@ async function invokeContractTx(
   // 5. Ensamblar la transacción con los datos de simulación
   const preparedTx = StellarSdk.rpc.assembleTransaction(tx, simulation).build();
 
-  // 6. Solicitar firma a Freighter
-  const signResponse = await signTransaction(preparedTx.toXDR(), {
-    networkPassphrase: NETWORK_PASSPHRASE,
-    address: callerPublicKey,
-  });
+  // 6. Solicitar firma a la billetera (Freighter o Albedo)
+  let signedXdr: string = "";
+  try {
+    const isFreighterAvail = await isConnected();
+    const isInstalled =
+      typeof isFreighterAvail === "boolean"
+        ? isFreighterAvail
+        : (isFreighterAvail as unknown as { isConnected: boolean })?.isConnected;
 
-  let signedXdr: string;
-  if (typeof signResponse === "object" && signResponse !== null) {
-    if ("error" in signResponse && signResponse.error) {
-      throw new Error(`Firma rechazada por el usuario en Freighter: ${signResponse.error}`);
+    if (isInstalled) {
+      const signResponse = await signTransaction(preparedTx.toXDR(), {
+        networkPassphrase: NETWORK_PASSPHRASE,
+        address: callerPublicKey,
+      });
+
+      if (typeof signResponse === "object" && signResponse !== null) {
+        if ("error" in signResponse && signResponse.error) {
+          throw new Error(`Firma rechazada por el usuario en Freighter: ${signResponse.error}`);
+        }
+        signedXdr = (signResponse as { signedTxXdr: string }).signedTxXdr;
+      } else {
+        signedXdr = signResponse as string;
+      }
     }
-    signedXdr = (signResponse as { signedTxXdr: string }).signedTxXdr;
-  } else {
-    signedXdr = signResponse as string;
+  } catch (err: unknown) {
+    console.warn("Firma con Freighter no completada, intentando con Albedo:", err);
+  }
+
+  // Si Freighter no firmó, intentar con Albedo
+  if (!signedXdr) {
+    try {
+      const albedoRes = await firmarTransaccionAlbedo(preparedTx.toXDR());
+      if (albedoRes.txHash) {
+        return {
+          txHash: albedoRes.txHash,
+          explorerUrl: `https://stellar.expert/explorer/testnet/tx/${albedoRes.txHash}`,
+          result: null,
+        };
+      }
+      signedXdr = albedoRes.signedEnvelopeXdr;
+    } catch (albedoErr: unknown) {
+      const msg = albedoErr instanceof Error ? albedoErr.message : "Firma rechazada";
+      throw new Error(`Error al firmar la transacción: ${msg}`);
+    }
   }
 
   if (!signedXdr) {
-    throw new Error("No se recibió la transacción firmada desde Freighter.");
+    throw new Error("No se pudo obtener la firma de la transacción.");
   }
 
-  // 7. Enviar la transacción firmada a la red
+  // 7. Enviar la transacción firmada a la red Stellar Testnet
   const signedTx = StellarSdk.TransactionBuilder.fromXDR(
     signedXdr,
     NETWORK_PASSPHRASE
@@ -150,13 +200,19 @@ async function invokeContractTx(
     throw new Error(`Error al enviar la transacción: ${JSON.stringify(sendResponse.errorResult)}`);
   }
 
-  // 8. Esperar la confirmación en el ledger (polling)
+  // 8. Esperar la confirmación en el ledger con polling y límite de tiempo
   const txHash = sendResponse.hash;
   let txResult = await server.getTransaction(txHash);
 
-  while (txResult.status === StellarSdk.rpc.Api.GetTransactionStatus.NOT_FOUND) {
+  let attempts = 0;
+  const maxAttempts = 20; // hasta 20 segundos de espera
+  while (
+    txResult.status === StellarSdk.rpc.Api.GetTransactionStatus.NOT_FOUND &&
+    attempts < maxAttempts
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     txResult = await server.getTransaction(txHash);
+    attempts++;
   }
 
   if (txResult.status === StellarSdk.rpc.Api.GetTransactionStatus.FAILED) {
@@ -164,7 +220,10 @@ async function invokeContractTx(
   }
 
   let parsedReturnValue: unknown = null;
-  if (txResult.returnValue) {
+  if (
+    txResult.status === StellarSdk.rpc.Api.GetTransactionStatus.SUCCESS &&
+    txResult.returnValue
+  ) {
     try {
       parsedReturnValue = StellarSdk.scValToNative(txResult.returnValue);
     } catch {
@@ -268,7 +327,7 @@ export async function crearLoteGanado(
     return await invokeContractTx(sellerAddr, "create_lot", args);
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : "Error al crear lote de ganado";
-    console.error("[crearLoteGanado]", msg);
+    console.warn("[crearLoteGanado]", msg);
     throw new Error(msg);
   }
 }
@@ -309,7 +368,7 @@ export async function verificarVeterinario(
     return await invokeContractTx(vetAddr, "verify_lot", args);
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : "Error al certificar lote";
-    console.error("[verificarVeterinario]", msg);
+    console.warn("[verificarVeterinario]", msg);
     throw new Error(msg);
   }
 }
@@ -348,7 +407,7 @@ export async function realizarPuja(
     return await invokeContractTx(compradorAddr, "place_bid", args);
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : "Error al realizar puja";
-    console.error("[realizarPuja]", msg);
+    console.warn("[realizarPuja]", msg);
     throw new Error(msg);
   }
 }
@@ -381,8 +440,26 @@ export async function liquidarSubasta(
     return await invokeContractTx(compradorAddr, "settle_auction", args);
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : "Error al liquidar subasta";
-    console.error("[liquidarSubasta]", msg);
+    console.warn("[liquidarSubasta]", msg);
     throw new Error(msg);
+  }
+}
+
+// ============================================================================
+// VALIDACIÓN DE CONTRACT ID
+// ============================================================================
+
+export function isValidContractId(id: string): boolean {
+  try {
+    return Boolean(
+      id &&
+      typeof id === "string" &&
+      id.length === 56 &&
+      id.startsWith("C") &&
+      StellarSdk.StrKey.isValidContract(id)
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -394,6 +471,10 @@ export async function liquidarSubasta(
  * Consulta el estado de un lote mediante simulación (sin requerir firma ni gas).
  */
 export async function obtenerLote(lotId: number | bigint): Promise<CattleLot> {
+  if (!isValidContractId(CONTRACT_ID)) {
+    throw new Error(`ID de contrato no configurado o inválido: ${CONTRACT_ID}`);
+  }
+
   try {
     const contract = new StellarSdk.Contract(CONTRACT_ID);
     const operation = contract.call(
@@ -401,9 +482,12 @@ export async function obtenerLote(lotId: number | bigint): Promise<CattleLot> {
       StellarSdk.nativeToScVal(BigInt(lotId), { type: "u64" })
     );
 
-    // Simulación anónima usando la dirección del propio contrato como fuente temporal
-    const fakeAccount = new StellarSdk.Account(CONTRACT_ID, "0");
-    const tx = new StellarSdk.TransactionBuilder(fakeAccount, {
+    // Cuenta dummy válida (G...) para simulación de lectura pública en Soroban
+    const dummyAccount = new StellarSdk.Account(
+      "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVGUN",
+      "0"
+    );
+    const tx = new StellarSdk.TransactionBuilder(dummyAccount, {
       fee: StellarSdk.BASE_FEE,
       networkPassphrase: NETWORK_PASSPHRASE,
     })
@@ -434,7 +518,7 @@ export async function obtenerLote(lotId: number | bigint): Promise<CattleLot> {
     };
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : `Error obteniendo lote #${lotId}`;
-    console.error("[obtenerLote]", msg);
+    console.warn("[obtenerLote]", msg);
     throw new Error(msg);
   }
 }

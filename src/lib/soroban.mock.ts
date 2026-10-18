@@ -13,17 +13,17 @@ import {
   getLotBids,
 } from "@/services/mockService";
 
-import { Lote, TxResult, explorerTx, cattleLotToLote } from "./types";
+import { Lote, TxResult, explorerTx, cattleLotToLote, FALLBACK_CONTRACT_URL } from "./types";
 import type { CattleLot, AuctionSettlement } from "@/types/ganado";
 
 // ─── Almacén de pujas más altas por lote (mock) ─────
 const highestBids: Record<string, { amount: number; bidder: string }> = {};
 
-const fakeTxResult = (hash?: string): TxResult => {
-  const h = hash ?? Array.from({ length: 64 }, () =>
-    Math.floor(Math.random() * 16).toString(16)
-  ).join("");
-  return { hash: h, explorerUrl: explorerTx(h) };
+const fakeTxResult = (_hash?: string): TxResult => {
+  return {
+    hash: "contract_verified",
+    explorerUrl: FALLBACK_CONTRACT_URL,
+  };
 };
 
 /** Conecta wallet via backend mock */

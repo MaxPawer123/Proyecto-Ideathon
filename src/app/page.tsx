@@ -62,10 +62,17 @@ export default function Home() {
 
   const ejecutar = async (fn: () => Promise<TxResult>) => {
     setBusy(true);
-    setMsg(null);
+    setMsg({ ok: true, text: "⏳ Firmando transacción y esperando confirmación en el ledger…" });
     try {
       const r = await fn();
-      setMsg({ ok: true, text: "✅ Transacción confirmada en la blockchain", url: r.explorerUrl });
+      const isContract = r.explorerUrl.includes("/contract/");
+      setMsg({
+        ok: true,
+        text: isContract
+          ? "✅ Operación registrada en el Smart Contract de Testnet"
+          : "✅ Transacción confirmada en la blockchain",
+        url: r.explorerUrl,
+      });
       await refrescar();
     } catch (e: any) {
       setMsg({ ok: false, text: e?.message ?? String(e) });
@@ -469,7 +476,9 @@ export default function Home() {
                     target="_blank"
                     rel="noreferrer"
                   >
-                    🔍 Ver en Stellar Expert →
+                    {msg.url.includes("/contract/")
+                      ? "🔍 Ver Smart Contract en Stellar Expert →"
+                      : "🔍 Ver Transacción en Stellar Expert →"}
                   </a>
                 )}
               </div>

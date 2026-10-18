@@ -17,8 +17,8 @@ export const STELLAR_CONFIG = {
   HORIZON_URL: 'https://horizon-testnet.stellar.org',
   FRIENDBOT_URL: 'https://friendbot.stellar.org',
   
-  // Contrato — ¡REEMPLAZAR con el ID real del deploy!
-  CONTRACT_ID: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU45ZCBD3',
+  // Contrato en Testnet verificado en Stellar Expert
+  CONTRACT_ID: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
   
   // USDC Testnet asset (ejemplo — ajustar al token que usen)
   USDC_CONTRACT_ID: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
