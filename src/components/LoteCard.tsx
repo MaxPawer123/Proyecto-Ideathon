@@ -6,12 +6,12 @@ export default function LoteCard({ lote }: { lote: Lote }) {
   const { fee, vendedor } = calcularComision(lote.highestBid);
 
   const estado = lote.isSettled
-    ? { t: "Pagado", c: "status-settled", icon: "✅" }
+    ? { t: "Pagado", c: "status-settled", icon: "" }
     : lote.isVerified && lote.pestFree
-    ? { t: "Verificado · En subasta", c: "status-verified", icon: "🟢" }
-    : lote.isVerified
-    ? { t: "Rechazado por plagas", c: "status-rejected", icon: "🔴" }
-    : { t: "Esperando veterinario", c: "status-pending", icon: "⏳" };
+      ? { t: "Verificado · En subasta", c: "status-verified", icon: "" }
+      : lote.isVerified
+        ? { t: "Rechazado por plagas", c: "status-rejected", icon: "" }
+        : { t: "Esperando veterinario", c: "status-pending", icon: "" };
 
   const stars = lote.isVerified
     ? "★".repeat(lote.vetScore) + "☆".repeat(5 - lote.vetScore)
